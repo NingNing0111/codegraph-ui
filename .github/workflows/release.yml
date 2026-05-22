@@ -1,0 +1,106 @@
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            binary: codegraph-ui
+            archive: codegraph-ui-aarch64-apple-darwin.tar.gz
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            binary: codegraph-ui
+            archive: codegraph-ui-x86_64-apple-darwin.tar.gz
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            binary: codegraph-ui.exe
+            archive: codegraph-ui-x86_64-pc-windows-msvc.zip
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.85.0
+          targets: ${{ matrix.target }}
+
+      - name: Build release binary
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Verify macOS binary
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          test -f "target/${{ matrix.target }}/release/${{ matrix.binary }}"
+          test -s "target/${{ matrix.target }}/release/${{ matrix.binary }}"
+
+      - name: Verify Windows binary
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "target/${{ matrix.target }}/release/${{ matrix.binary }}")) {
+            throw "Binary not found"
+          }
+          if ((Get-Item "target/${{ matrix.target }}/release/${{ matrix.binary }}").Length -le 0) {
+            throw "Binary is empty"
+          }
+
+      - name: Archive macOS binary
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          tar -czf "${{ matrix.archive }}" -C "target/${{ matrix.target }}/release" "${{ matrix.binary }}"
+          tar -tzf "${{ matrix.archive }}" >/dev/null
+
+      - name: Archive Windows binary
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Compress-Archive -Path "target/${{ matrix.target }}/release/${{ matrix.binary }}" -DestinationPath "${{ matrix.archive }}"
+          Expand-Archive -Path "${{ matrix.archive }}" -DestinationPath verify
+          if (-not (Test-Path "verify/${{ matrix.binary }}")) {
+            throw "Archive verification failed"
+          }
+
+      - name: Upload release asset
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: ${{ matrix.archive }}
+          if-no-files-found: error
+
+  release:
+    name: publish
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download release assets
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
+          files: |
+            dist/*.tar.gz
+            dist/*.zip
+          generate_release_notes: true
+          fail_on_unmatched_files: true
