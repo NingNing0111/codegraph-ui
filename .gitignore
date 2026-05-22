@@ -1,0 +1,5 @@
+/target
+.omc
+.claude
+*.db
+*.db*
