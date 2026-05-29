@@ -1,5 +1,6 @@
 use axum::{
     Json, Router,
+    extract::State,
     http::StatusCode,
     response::{Html, IntoResponse},
     routing::{get, post},
@@ -8,15 +9,20 @@ use rusqlite::{Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashSet,
-    fs,
+    env, fs,
     net::SocketAddr,
     path::{Path, PathBuf},
 };
 use tokio::net::TcpListener;
 
+#[derive(Clone)]
+struct AppState {
+    db_path: PathBuf,
+    root_path: PathBuf,
+}
+
 #[derive(Deserialize)]
 struct GraphRequest {
-    path: String,
     limit: Option<usize>,
     query: Option<String>,
     languages: Option<Vec<String>>,
@@ -25,8 +31,6 @@ struct GraphRequest {
 
 #[derive(Deserialize)]
 struct SnippetRequest {
-    db_path: String,
-    root_path: Option<String>,
     file_path: String,
     start_line: i64,
     end_line: i64,
@@ -124,6 +128,28 @@ struct Filters {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let config = match Config::parse() {
+        Ok(Some(config)) => config,
+        Ok(None) => {
+            println!("{}", usage());
+            return Ok(());
+        }
+        Err(message) => {
+            eprintln!("{message}");
+            std::process::exit(2);
+        }
+    };
+    let state = AppState {
+        db_path: normalize_path(&config.db_path)?,
+        root_path: normalize_path(&config.root_path)?,
+    };
+    if !state.db_path.is_file() {
+        return Err(format!("db 文件不存在: {}", state.db_path.display()).into());
+    }
+    if !state.root_path.is_dir() {
+        return Err(format!("项目根路径不存在: {}", state.root_path.display()).into());
+    }
+
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
     let url = format!("http://{}", addr);
@@ -131,10 +157,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/", get(index))
         .route("/api/graph", post(graph))
         .route("/api/snippet", post(snippet))
-        .route("/api/health", get(health));
+        .route("/api/health", get(health))
+        .with_state(state.clone());
 
     println!("代码库图谱可视化已启动: {url}");
-    println!("请在浏览器打开上面的 URL，然后选择 sqlite db 文件和项目根路径。");
+    println!("db 文件: {}", state.db_path.display());
+    println!("项目根路径: {}", state.root_path.display());
     let _ = open::that(&url);
     axum::serve(
         listener,
@@ -142,6 +170,78 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     )
     .await?;
     Ok(())
+}
+
+struct Config {
+    db_path: PathBuf,
+    root_path: PathBuf,
+}
+
+impl Config {
+    fn parse() -> Result<Option<Self>, String> {
+        let args = env::args().skip(1).collect::<Vec<_>>();
+        if args.iter().any(|arg| arg == "-h" || arg == "--help") {
+            return Ok(None);
+        }
+
+        let mut db_path = None;
+        let mut root_path = None;
+        let mut positionals = Vec::new();
+        let mut index = 0;
+        while index < args.len() {
+            match args[index].as_str() {
+                "--db" | "--db-path" => {
+                    index += 1;
+                    db_path = Some(next_arg(&args, index, "--db")?);
+                }
+                "--root" | "--root-path" => {
+                    index += 1;
+                    root_path = Some(next_arg(&args, index, "--root")?);
+                }
+                arg if arg.starts_with('-') => return Err(format!("未知参数: {arg}\n{}", usage())),
+                arg => positionals.push(PathBuf::from(arg)),
+            }
+            index += 1;
+        }
+
+        if db_path.is_none() && !positionals.is_empty() {
+            db_path = Some(positionals.remove(0));
+        }
+        if root_path.is_none() && !positionals.is_empty() {
+            root_path = Some(positionals.remove(0));
+        }
+        if !positionals.is_empty() {
+            return Err(format!(
+                "参数过多: {}\n{}",
+                positionals[0].display(),
+                usage()
+            ));
+        }
+
+        Ok(Some(Self {
+            db_path: db_path.ok_or_else(usage)?,
+            root_path: root_path.ok_or_else(usage)?,
+        }))
+    }
+}
+
+fn next_arg(args: &[String], index: usize, name: &str) -> Result<PathBuf, String> {
+    args.get(index)
+        .filter(|value| !value.starts_with('-'))
+        .map(PathBuf::from)
+        .ok_or_else(|| format!("{name} 缺少路径参数\n{}", usage()))
+}
+
+fn normalize_path(path: &Path) -> Result<PathBuf, std::io::Error> {
+    if path.is_absolute() {
+        Ok(path.to_path_buf())
+    } else {
+        Ok(env::current_dir()?.join(path))
+    }
+}
+
+fn usage() -> String {
+    "用法: codegraph-ui --db <sqlite-db-path> --root <project-root-path>\n也支持: codegraph-ui <sqlite-db-path> <project-root-path>".to_string()
 }
 
 async fn health() -> Json<serde_json::Value> {
@@ -154,17 +254,12 @@ async fn index() -> Html<&'static str> {
     Html(INDEX_HTML)
 }
 
-async fn graph(Json(request): Json<GraphRequest>) -> Result<Json<GraphResponse>, AppError> {
-    let db_path = request.path.trim();
-    if db_path.is_empty() {
-        return Err(AppError::bad_request("请选择 db 文件"));
-    }
-    if !Path::new(db_path).is_file() {
-        return Err(AppError::bad_request("db 文件不存在"));
-    }
-
+async fn graph(
+    State(state): State<AppState>,
+    Json(request): Json<GraphRequest>,
+) -> Result<Json<GraphResponse>, AppError> {
     let limit = request.limit.unwrap_or(500).clamp(50, 3_000);
-    let conn = Connection::open_with_flags(db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let conn = Connection::open_with_flags(&state.db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
     ensure_schema(&conn)?;
 
     let summary = load_summary(&conn)?;
@@ -195,7 +290,7 @@ async fn graph(Json(request): Json<GraphRequest>) -> Result<Json<GraphResponse>,
     let files = load_files(&conn, &node_ids)?;
 
     Ok(Json(GraphResponse {
-        db_path: db_path.to_string(),
+        db_path: state.db_path.display().to_string(),
         summary,
         files,
         nodes,
@@ -204,22 +299,15 @@ async fn graph(Json(request): Json<GraphRequest>) -> Result<Json<GraphResponse>,
     }))
 }
 
-async fn snippet(Json(request): Json<SnippetRequest>) -> Result<Json<SnippetResponse>, AppError> {
-    let db_path = Path::new(request.db_path.trim());
-    if !db_path.is_file() {
-        return Err(AppError::bad_request("db 文件不存在"));
-    }
+async fn snippet(
+    State(state): State<AppState>,
+    Json(request): Json<SnippetRequest>,
+) -> Result<Json<SnippetResponse>, AppError> {
     if request.file_path.trim().is_empty() {
         return Err(AppError::bad_request("节点缺少文件路径"));
     }
 
-    let root_path = request
-        .root_path
-        .as_deref()
-        .map(str::trim)
-        .filter(|path| !path.is_empty())
-        .map(PathBuf::from);
-    let source_path = resolve_source_path(db_path, root_path.as_deref(), &request.file_path);
+    let source_path = resolve_source_path(&state.root_path, &request.file_path);
     if !source_path.is_file() {
         return Err(AppError::bad_request(format!(
             "找不到源码文件: {}",
@@ -257,18 +345,13 @@ async fn snippet(Json(request): Json<SnippetRequest>) -> Result<Json<SnippetResp
     }))
 }
 
-fn resolve_source_path(db_path: &Path, root: Option<&Path>, file_path: &str) -> PathBuf {
+fn resolve_source_path(root: &Path, file_path: &str) -> PathBuf {
     let source_path = Path::new(file_path);
     if source_path.is_absolute() {
-        return source_path.to_path_buf();
+        source_path.to_path_buf()
+    } else {
+        root.join(source_path)
     }
-    if let Some(root) = root {
-        return root.join(source_path);
-    }
-    db_path
-        .parent()
-        .unwrap_or_else(|| Path::new("."))
-        .join(source_path)
 }
 
 fn ensure_schema(conn: &Connection) -> Result<(), AppError> {
@@ -590,19 +673,15 @@ const INDEX_HTML: &str = r#"<!doctype html>
   <aside>
     <header>
       <h1>代码库知识图谱</h1>
-      <div class="hint">选择 README 描述的 sqlite db 文件，浏览 files / nodes / edges。</div>
+      <div class="hint">启动时传入的 sqlite db 文件已加载，浏览 files / nodes / edges。</div>
     </header>
     <div class="section stack">
-      <label>数据库文件</label>
-      <input id="dbPath" placeholder="输入 db 文件绝对路径" />
-      <label>项目根路径</label>
-      <input id="rootPath" placeholder="输入项目根目录绝对路径" />
       <div class="row">
         <input id="query" placeholder="搜索名称/路径" />
         <select id="limit"><option>200</option><option selected>500</option><option>1000</option><option>2000</option><option>3000</option></select>
       </div>
       <button id="loadBtn">加载图谱</button>
-      <div class="hint">大仓库建议先搜索目录/文件名，或使用 200/500 节点上限。项目根路径用于打开源码片段。</div>
+      <div class="hint">大仓库建议先搜索目录/文件名，或使用 200/500 节点上限。</div>
       <div id="error" class="error"></div>
     </div>
     <div class="section">
@@ -670,12 +749,10 @@ $('layoutBtn').addEventListener('click', () => renderGraph());
 
 async function loadGraph() {
   $('error').textContent = '';
-  const path = $('dbPath').value.trim();
-  if (!path) { $('error').textContent = '请输入 db 文件绝对路径。'; return; }
   $('graphInfo').textContent = '加载中...';
   try {
     const res = await fetch('/api/graph', { method:'POST', headers:{'content-type':'application/json'}, body: JSON.stringify({
-      path, limit: Number($('limit').value || 500), query: $('query').value,
+      limit: Number($('limit').value || 500), query: $('query').value,
       languages: [...state.selectedLanguages], kinds: [...state.selectedKinds]
     }) });
     const json = await res.json();
@@ -779,8 +856,6 @@ async function loadSnippet(n) {
   target.innerHTML = '<div class="hint">源码加载中...</div>';
   try {
     const res = await fetch('/api/snippet', { method:'POST', headers:{'content-type':'application/json'}, body: JSON.stringify({
-      db_path: state.data.db_path,
-      root_path: $('rootPath').value.trim(),
       file_path: n.file_path,
       start_line: n.start_line,
       end_line: n.end_line,
